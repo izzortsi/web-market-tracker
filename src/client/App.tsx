@@ -1,21 +1,27 @@
 import { useEffect, useState } from 'react';
 import Plot from 'react-plotly.js';
-import type { MarketSummaryPayload, SymbolSnapshot, OHLC } from '../server/types/ticker.js';
+import type { MarketSummaryPayload, SymbolSnapshot, OHLC } from '../shared/types/market.js';
 import './styles.css';
 
 const API_URL = '/api/market/summary';
 
 export default function App() {
   const [data, setData] = useState<MarketSummaryPayload | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     const interval = setInterval(async () => {
       try {
         const res = await fetch(API_URL);
-        if (!res.ok) return;
+        if (!res.ok) {
+          setError(`API error: ${res.status}`);
+          return;
+        }
         const json = await res.json();
+        setError(null);
         setData(json);
       } catch (err) {
+        setError('API unreachable');
         console.error(err);
       }
     }, 1000);
@@ -31,6 +37,7 @@ export default function App() {
         <div className="card">
           <h3>Warming up…</h3>
           <p>Waiting for live ticker data.</p>
+          {error && <p>{error}</p>}
         </div>
       </div>
     );
@@ -111,6 +118,7 @@ function SymbolCard({ sym }: { sym: SymbolSnapshot }) {
           24h: {sym.change24hPct.toFixed(2)}%
         </span>
         <span>|HL|: {(sym.hlDiffAbs * 100).toFixed(2)}%</span>
+        <span>Accel: {(sym.accel ?? 0).toFixed(4)}</span>
         <span>Score: {sym.score.toFixed(3)}</span>
       </div>
       <Plot
