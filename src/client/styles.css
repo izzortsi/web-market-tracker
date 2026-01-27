@@ -1,0 +1,81 @@
+:root {
+  font-family: 'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  color: #e6edf3;
+  background-color: #0b1621;
+}
+
+body {
+  margin: 0;
+  background: #0b1621;
+}
+
+.page {
+  padding: 16px;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+.header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+
+.metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 12px;
+}
+
+.card {
+  background: #111c2b;
+  border: 1px solid #1f2c3d;
+  border-radius: 10px;
+  padding: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+}
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.sym {
+  font-weight: 700;
+  font-size: 18px;
+}
+
+.meta {
+  color: #7c8aa5;
+  font-size: 12px;
+}
+
+.price {
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.stats {
+  display: flex;
+  gap: 10px;
+  font-size: 12px;
+  color: #c9d2e0;
+  margin: 6px 0 8px 0;
+}
+
+.pos {
+  color: #00c896;
+}
+
+.neg {
+  color: #ff6b6b;
+}
