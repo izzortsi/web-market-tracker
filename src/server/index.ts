@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import capRanks from './market_caps.json' with { type: 'json' };
 import { MarketStore } from './lib/marketStore.js';
 import { BinanceTickerClient } from './lib/binanceClient.js';
 import { MarketSummaryPayload } from './types/ticker.js';
@@ -13,13 +14,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const capWeights = {
-  BTCUSDT: 1,
-  ETHUSDT: 2,
-  BNBUSDT: 3,
-  SOLUSDT: 4,
-  XRPUSDT: 5
-};
+const capWeights: Record<string, number> = capRanks;
 
 const store = new MarketStore(capWeights);
 const client = new BinanceTickerClient(store);

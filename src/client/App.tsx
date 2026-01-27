@@ -22,6 +22,20 @@ export default function App() {
     return () => clearInterval(interval);
   }, []);
 
+  if (!data) {
+    return (
+      <div className="page">
+        <header className="header">
+          <h1>Market Tracker</h1>
+        </header>
+        <div className="card">
+          <h3>Warming up…</h3>
+          <p>Waiting for live ticker data.</p>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="page">
       <header className="header">
@@ -30,17 +44,17 @@ export default function App() {
       <section className="metrics">
         <MetricChart
           title="Aggregate Momentum"
-          series={data?.market.momentum ?? []}
+          series={data.market.momentum}
           color="#00c896"
         />
         <MetricChart
           title="Aggregate Acceleration"
-          series={data?.market.acceleration ?? []}
+          series={data.market.acceleration}
           color="#ff6b6b"
         />
       </section>
       <section className="cards">
-        {(data?.top ?? []).map((sym: SymbolSnapshot) => (
+        {data.top.map((sym: SymbolSnapshot) => (
           <SymbolCard key={sym.sym} sym={sym} />
         ))}
       </section>

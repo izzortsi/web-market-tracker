@@ -4,7 +4,10 @@ import { OHLC, SymbolSnapshot, MarketSummaryPayload, TickerEvent, MarketSeriesPo
 type SymbolState = {
   buffer: RingBuffer<TickerEvent>;
   lastPrice?: number;
+  prevSpeed?: number;
   lastSpeed?: number;
+  lastAccel?: number;
+  lastTimestamp?: number;
   capRank: number;
 };
 
@@ -33,17 +36,32 @@ export class MarketStore {
       state.buffer.push(ev);
 
       const price = parseFloat(ev.c);
+      const ts = ev.E;
       if (!Number.isFinite(price)) {
         this.symbols.set(sym, state);
         continue;
       }
 
-      if (state.lastPrice !== undefined) {
-        const dt = 1; // Binance stream push not uniform; approximate per tick
-        const speed = (price - state.lastPrice) / dt;
+      if (state.lastPrice !== undefined && state.lastTimestamp !== undefined) {
+        const dtSec = Math.max((ts - state.lastTimestamp) / 1000, 1e-3);
+        const speed = (price - state.lastPrice) / dtSec;
+        let accel: number | undefined;
+        if (state.lastSpeed !== undefined) {
+          accel = (speed - state.lastSpeed) / dtSec;
+        }
+        state.prevSpeed = state.lastSpeed;
         state.lastSpeed = speed;
+        if (accel !== undefined) {
+          state.lastAccel = accel;
+        }
+      } else {
+        state.lastSpeed = undefined;
+        state.prevSpeed = undefined;
+        state.lastAccel = undefined;
       }
+
       state.lastPrice = price;
+      state.lastTimestamp = ts;
 
       this.symbols.set(sym, state);
     }
@@ -146,18 +164,16 @@ export class MarketStore {
   }
 
   private computeAggregateAcceleration(): number {
-    // Simple discrete acceleration from momentum slope; here reuse lastSpeed deltas across symbols averaged
-    let sumAccel = 0;
+    let total = 0;
     let count = 0;
     for (const [, state] of this.symbols.entries()) {
-      if (state.lastSpeed !== undefined && state.lastPrice !== undefined) {
-        // placeholder: without previous speed history per symbol, approximate with zero accel
-        sumAccel += 0;
+      if (state.lastAccel !== undefined) {
+        total += state.lastAccel;
         count += 1;
       }
     }
     if (count === 0) return 0;
-    return sumAccel / count;
+    return total / count;
   }
 }
 
