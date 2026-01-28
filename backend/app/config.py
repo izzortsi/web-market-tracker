@@ -1,14 +1,23 @@
 from pathlib import Path
 
-STREAM_URL = "wss://fstream.binance.com/stream?streams=!ticker@arr"
+KAFKA_BROKER = "localhost:9092"
+RAW_TOPIC = "raw"
+PROCESSED_TOPIC = "processed"
 
-RECONNECT_DELAY_SEC = 3
-PING_INTERVAL_SEC = 20
-PING_TIMEOUT_SEC = 10
+RAW_TOPIC_PARTITIONS = 12
+PROCESSED_TOPIC_PARTITIONS = 6
 
+BAR_INTERVAL_SEC = 5
 SNAPSHOT_INTERVAL_SEC = 1.0
+
 RING_SIZE = 500
 MAX_SERIES_POINTS = 300
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
-MARKET_CAPS_PATH = DATA_DIR / "market_caps.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+STORE_DIR = PROJECT_ROOT / "stored"
+RAW_STORE_DIR = STORE_DIR / "raw"
+PROCESSED_STORE_DIR = STORE_DIR / "processed"
+
+RAW_FLUSH_SIZE = 2000
+PROCESSED_FLUSH_SIZE = 500
+FLUSH_INTERVAL_SEC = 5.0

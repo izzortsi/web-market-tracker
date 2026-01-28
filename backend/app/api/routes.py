@@ -6,7 +6,7 @@ router = APIRouter()
 
 @router.get("/api/market/summary")
 async def get_market_summary(request: Request):
-    latest = getattr(request.app.state, "latest_snapshot", None)
-    if latest is None:
+    processor = getattr(request.app.state, "processor", None)
+    if processor is None:
         return JSONResponse({"message": "warming up"}, status_code=status.HTTP_503_SERVICE_UNAVAILABLE)
-    return latest
+    return processor.get_snapshot()

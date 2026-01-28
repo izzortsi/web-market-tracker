@@ -3,3 +3,10 @@ uvicorn[standard]==0.32.1
 websockets==12.0
 pydantic==2.10.4
 python-dotenv==1.0.1
+kafka-python
+binance-sdk-derivatives-trading-usds-futures
+binance-common
+pandas
+pandas-ta
+pyarrow
+requests
