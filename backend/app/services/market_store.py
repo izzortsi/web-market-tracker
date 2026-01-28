@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Any
 
 from .ring_buffer import RingBuffer
-from ..config import RING_SIZE, MAX_SERIES_POINTS
+from ..config import RING_SIZE, MAX_SERIES_POINTS, CANDLE_WINDOW_MS, CANDLE_COUNT
 
 
 @dataclass
@@ -108,7 +108,7 @@ class MarketStore:
             weight = 1.0 / max(1, cap_rank)
             score = weight + normalized_hl
 
-            ohlc = build_ohlc(vals, 60_000, now)
+            ohlc = build_ohlc(vals, CANDLE_WINDOW_MS, now)
 
             symbol_snapshots.append(
                 {
@@ -195,7 +195,7 @@ def build_ohlc(events: List[dict], window_ms: int, now: int) -> List[dict]:
         if o is not None and c is not None and h != float("-inf") and l != float("inf"):
             result.append({"t": bucket * window_ms, "o": o, "h": h, "l": l, "c": c})
 
-    return result[-5:]
+    return result[-CANDLE_COUNT:]
 
 
 def _parse_float(value: Any) -> Optional[float]:

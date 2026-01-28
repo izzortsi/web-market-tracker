@@ -72,6 +72,13 @@ def _candlestick_figure(ohlc: List[Dict[str, Any]]) -> go.Figure:
     return fig
 
 
+order_filter_options = [
+    {"label": "Score", "value": "score"},
+    {"label": "24h Change", "value": "change24hPct"},
+    {"label": "HL Diff", "value": "hlDiffAbs"},
+    {"label": "Acceleration", "value": "accel"},
+]
+
 app.layout = html.Div(
     className="page",
     children=[
@@ -84,6 +91,46 @@ app.layout = html.Div(
                 dcc.Graph(id="accel", figure=_empty_figure("Aggregate Acceleration", "#ff6b6b")),
             ],
         ),
+        html.Div(
+            className="controls",
+            children=[
+                html.Div("Symbols", className="controls-title"),
+                html.Div(
+                    className="controls-right",
+                    children=[
+                        dcc.Dropdown(
+                            id="order_by",
+                            options=order_filter_options,
+                            value="score",
+                            multi=False,
+                            className="control-dropdown",
+                            placeholder="Order by",
+                            clearable=False,
+                        ),
+                        dcc.Dropdown(
+                            id="order_dir",
+                            options=[
+                                {"label": "Descending", "value": "desc"},
+                                {"label": "Ascending", "value": "asc"},
+                            ],
+                            value="desc",
+                            multi=False,
+                            className="control-dropdown",
+                            placeholder="Order dir",
+                            clearable=False,
+                        ),
+                        dcc.Dropdown(
+                            id="filter_by",
+                            options=order_filter_options,
+                            value=None,
+                            multi=False,
+                            className="control-dropdown",
+                            placeholder="Filter by",
+                        ),
+                    ],
+                ),
+            ],
+        ),
         html.Div(id="cards", className="cards"),
     ],
 )
@@ -94,8 +141,11 @@ app.layout = html.Div(
     Output("accel", "figure"),
     Output("cards", "children"),
     Input("refresh", "n_intervals"),
+    Input("order_by", "value"),
+    Input("order_dir", "value"),
+    Input("filter_by", "value"),
 )
-def update_dashboard(_: int):
+def update_dashboard(_: int, order_by: str, order_dir: str, filter_by: str):
     try:
         resp = requests.get(API_URL, timeout=2)
         if resp.status_code != 200:
@@ -115,8 +165,28 @@ def update_dashboard(_: int):
     momentum_fig = _line_figure("Aggregate Momentum", payload["market"]["momentum"], "#00c896")
     accel_fig = _line_figure("Aggregate Acceleration", payload["market"]["acceleration"], "#ff6b6b")
 
+    order_by = order_by or "score"
+    order_dir = order_dir or "desc"
+    filter_by = filter_by or ""
+
+    symbols = payload["top"]
+
+    if filter_by:
+        filtered = sorted(
+            symbols,
+            key=lambda s: (s.get(filter_by) or 0),
+            reverse=(order_dir == "desc"),
+        )
+        filtered = filtered[:1]
+    else:
+        filtered = sorted(
+            symbols,
+            key=lambda s: (s.get(order_by) or 0),
+            reverse=(order_dir == "desc"),
+        )
+
     cards = []
-    for sym in payload["top"]:
+    for sym in filtered:
         stats = html.Div(
             className="stats",
             children=[
