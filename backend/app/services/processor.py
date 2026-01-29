@@ -4,93 +4,130 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, Optional, Any, List
 
-import pandas as pd
-import pandas_ta as ta
-import requests
-from kafka import KafkaConsumer, KafkaProducer
-from kafka.admin import KafkaAdminClient, NewTopic
+from kafka import KafkaConsumer
 
 from ..config import (
-    BAR_INTERVAL_SEC,
-    FLUSH_INTERVAL_SEC,
+    BINANCE_REST_BASE,
+    GLOBAL_TICK_SEC,
     KAFKA_BROKER,
-    PROCESSED_FLUSH_SIZE,
-    PROCESSED_STORE_DIR,
-    PROCESSED_TOPIC,
-    PROCESSED_TOPIC_PARTITIONS,
-    RAW_FLUSH_SIZE,
-    RAW_STORE_DIR,
     RAW_TOPIC,
-    RAW_TOPIC_PARTITIONS,
-    SNAPSHOT_INTERVAL_SEC,
-    CANDLE_COUNT,
+    EMA_ALPHA,
+    EMA_BETA,
+    EMA_GAMMA,
+    MAX_ACTIVE_SYMBOLS,
+    RANGE_LOW,
+    RANGE_HIGH,
+    MIN_QUOTE_VOLUME_24H,
+    VOL_STD_WINDOW_COUNT,
+    VOL_REFRESH_SEC,
+    FEE_ROUND_TRIP,
+    SLIP_BUFFER,
+    VOL_FEE_MULTIPLIER,
+    PROMOTION_CONFIRM_SEC,
+    PROMOTION_MIN_HOLD_SEC,
+    KLINE_INTERVAL,
+    KLINE_BOOTSTRAP_COUNT,
+    KELTNER_EMA_LENGTH,
+    KELTNER_ATR_LENGTH,
+    KELTNER_MULTIPLES,
+    MAX_SERIES_POINTS,
+    AGG_TRADE_CHUNK_SIZE,
+    AGG_TRADE_MIN_CHUNK_SIZE,
+    AGG_TRADE_MAX_FAIL_BEFORE_REDUCE,
+    AGG_TRADE_RECONNECT_SEC,
+    LOG_SCREENING_EVERY_SEC,
+    LOG_CANDIDATE_LIMIT,
 )
-from .market_store import MarketStore
+from .agg_trade_streams import AggTradeStreamManager, AggTradeEvent
+from .global_metrics import GlobalMetricEngine, GlobalMetricSample
+from .volatility import VolatilityService
+from .screener import Screener, ScreeningResult
+from .kline_tracker import KlineTrackerManager
+from .universe import UniverseManager
 
 logger = logging.getLogger(__name__)
-
-BAR_INTERVAL_MS = BAR_INTERVAL_SEC * 1000
-REST_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
-
-
-@dataclass
-class BarState:
-    bucket: int
-    o: float
-    h: float
-    l: float
-    c: float
-    v: float
-    ts: int
 
 
 class ProcessorService:
     def __init__(self) -> None:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
-        self.latest_snapshot: Optional[dict] = None
 
-        self._market_store = MarketStore({})
-        self._bars: Dict[str, BarState] = {}
-        self._bar_history: Dict[str, List[dict]] = {}
-        self._seeded: set[str] = set()
-        self._live_initialized: set[str] = set()
-        self._watchlist: set[str] = set()
-        self._ticker_stats: Dict[str, dict] = {}
-        self._last_watchlist_refresh = time.monotonic()
-
-        self._raw_buffer: List[dict] = []
-        self._processed_buffer: List[dict] = []
-        self._last_flush = time.monotonic()
-        self._last_message_time = time.monotonic()
-
-        self._producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BROKER,
-            key_serializer=lambda k: k.encode("utf-8"),
-            value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-        )
         self._consumer = KafkaConsumer(
             RAW_TOPIC,
             bootstrap_servers=KAFKA_BROKER,
             group_id="raw-processor",
-            auto_offset_reset="earliest",
+            auto_offset_reset="latest",
             enable_auto_commit=True,
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         )
 
-        self._ensure_topics()
-        RAW_STORE_DIR.mkdir(parents=True, exist_ok=True)
-        PROCESSED_STORE_DIR.mkdir(parents=True, exist_ok=True)
+        self.universe = UniverseManager(BINANCE_REST_BASE)
+        self.metrics = GlobalMetricEngine(
+            alpha=EMA_ALPHA,
+            beta=EMA_BETA,
+            gamma=EMA_GAMMA,
+            max_samples=MAX_SERIES_POINTS,
+        )
+        self.volatility = VolatilityService(
+            rest_base=BINANCE_REST_BASE,
+            interval=KLINE_INTERVAL,
+            window_count=VOL_STD_WINDOW_COUNT,
+            refresh_sec=VOL_REFRESH_SEC,
+        )
+        self.screener = Screener(
+            volatility=self.volatility,
+            max_active_symbols=MAX_ACTIVE_SYMBOLS,
+            range_low=RANGE_LOW,
+            range_high=RANGE_HIGH,
+            min_quote_volume_24h=MIN_QUOTE_VOLUME_24H,
+            fee_round_trip=FEE_ROUND_TRIP,
+            slip_buffer=SLIP_BUFFER,
+            vol_fee_multiplier=VOL_FEE_MULTIPLIER,
+            confirm_sec=PROMOTION_CONFIRM_SEC,
+            min_hold_sec=PROMOTION_MIN_HOLD_SEC,
+        )
+        self.kline_tracker = KlineTrackerManager(
+            rest_base=BINANCE_REST_BASE,
+            interval=KLINE_INTERVAL,
+            bootstrap_count=KLINE_BOOTSTRAP_COUNT,
+            ema_length=KELTNER_EMA_LENGTH,
+            atr_length=KELTNER_ATR_LENGTH,
+            band_multiples=KELTNER_MULTIPLES,
+        )
+
+        self._agg_trade_manager: Optional[AggTradeStreamManager] = None
+        self._ticker_stats: Dict[str, dict] = {}
+        self._eligible_symbols: set[str] = set()
+        self.latest_global_sample: Optional[GlobalMetricSample] = None
+        self.latest_screening: Optional[ScreeningResult] = None
+        self._last_screen_log = 0.0
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        try:
+            self.universe.bootstrap()
+            self._ticker_stats.update(self.universe.ticker_24h)
+            self._eligible_symbols = set(self.universe.eligible_symbols)
+        except Exception as exc:
+            logger.warning("Universe bootstrap failed: %s", exc)
+
+        self.kline_tracker.start()
+
+        symbols = list(self.universe.eligible_symbols)
+        self._agg_trade_manager = AggTradeStreamManager(
+            symbols=symbols,
+            chunk_size=AGG_TRADE_CHUNK_SIZE,
+            reconnect_delay_sec=AGG_TRADE_RECONNECT_SEC,
+            on_trade=self._handle_trade,
+            min_chunk_size=AGG_TRADE_MIN_CHUNK_SIZE,
+            max_failures_before_reduce=AGG_TRADE_MAX_FAIL_BEFORE_REDUCE,
+        )
+        self._agg_trade_manager.start()
+
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -99,297 +136,139 @@ class ProcessorService:
         if self._thread:
             self._thread.join(timeout=5)
         self._consumer.close()
-        self._producer.close()
+        self.kline_tracker.stop()
+        if self._agg_trade_manager:
+            self._agg_trade_manager.stop()
 
-    def get_snapshot(self) -> dict:
-        if self.latest_snapshot is not None:
-            return self.latest_snapshot
-        now_ms = int(time.time() * 1000)
-        return self._market_store.compute_snapshot(now_ms)
+    def get_global_series(self) -> List[dict]:
+        return [sample.__dict__ for sample in self.metrics.get_series()]
 
-    def _ensure_topics(self) -> None:
-        admin = KafkaAdminClient(bootstrap_servers=KAFKA_BROKER)
-        existing = {topic for topic in admin.list_topics()}
-        topics = []
-        if RAW_TOPIC not in existing:
-            topics.append(NewTopic(name=RAW_TOPIC, num_partitions=RAW_TOPIC_PARTITIONS, replication_factor=1))
-        if PROCESSED_TOPIC not in existing:
-            topics.append(NewTopic(name=PROCESSED_TOPIC, num_partitions=PROCESSED_TOPIC_PARTITIONS, replication_factor=1))
-        if topics:
-            admin.create_topics(topics)
-        admin.close()
+    def get_candidates(self) -> List[dict]:
+        if self.latest_screening is None:
+            return []
+        return [
+            {
+                "symbol": c.symbol,
+                "score": c.score,
+                "range_pos": c.range_pos,
+                "sigma_1m": c.sigma_1m,
+                "quote_volume_24h": c.quote_volume_24h,
+                "fee_threshold": c.fee_threshold,
+            }
+            for c in self.latest_screening.candidates
+        ]
+
+    def get_promoted(self) -> List[str]:
+        if self.latest_screening is None:
+            return []
+        return list(self.latest_screening.promoted)
+
+    def is_promoted(self, symbol: str) -> bool:
+        if self.latest_screening is None:
+            return False
+        return symbol in self.latest_screening.promoted
+
+    def get_symbol_state(self, symbol: str) -> Optional[dict]:
+        state = self.kline_tracker.get_state(symbol)
+        if state is None:
+            return None
+        keltner = None
+        if state.keltner:
+            keltner = {
+                "basis": state.keltner.basis,
+                "atr": state.keltner.atr,
+                "multiples": {
+                    str(k): {"lower": v[0], "upper": v[1]}
+                    for k, v in state.keltner.multiples.items()
+                },
+            }
+        return {
+            "symbol": state.symbol,
+            "interval": state.interval,
+            "updated_at_ms": state.updated_at_ms,
+            "klines": [
+                {
+                    "t": k.open_time,
+                    "T": k.close_time,
+                    "o": k.open,
+                    "h": k.high,
+                    "l": k.low,
+                    "c": k.close,
+                    "v": k.volume,
+                    "x": k.is_closed,
+                }
+                for k in state.klines
+            ],
+            "keltner": keltner,
+        }
 
     def _run(self) -> None:
-        next_snapshot = time.monotonic()
+        next_tick = time.monotonic()
         while not self._stop_event.is_set():
             try:
-                records = self._consumer.poll(timeout_ms=1000)
-                received = False
+                records = self._consumer.poll(timeout_ms=500)
                 for _, messages in records.items():
                     for msg in messages:
                         ev = msg.value
                         if not isinstance(ev, dict):
                             continue
-                        received = True
-                        self._last_message_time = time.monotonic()
                         self._handle_raw_event(ev)
 
                 now = time.monotonic()
-                if not received and (now - self._last_message_time) > 10:
-                    logger.warning("No raw messages received for >10s (raw topic: %s)", RAW_TOPIC)
-                    self._last_message_time = now
-
-                if now - self._last_watchlist_refresh > 5:
-                    self._refresh_watchlist()
-                    self._last_watchlist_refresh = now
-
-                if now >= next_snapshot:
-                    self._update_snapshot()
-                    next_snapshot = now + SNAPSHOT_INTERVAL_SEC
-
-                self._flush_buffers_if_needed()
+                if now >= next_tick:
+                    self._update_tick()
+                    next_tick = now + GLOBAL_TICK_SEC
             except Exception as exc:
                 logger.exception("Processor loop error: %s", exc)
                 time.sleep(1)
 
     def _handle_raw_event(self, ev: dict) -> None:
-        clean = _strip_additional_properties(ev)
-        self._raw_buffer.append(clean)
-
-        sym = clean.get("s")
-        ts = clean.get("E")
-        price = _parse_float(clean.get("c"))
+        sym = ev.get("s")
+        ts = ev.get("E")
+        price = _parse_float(ev.get("c"))
         if sym is None or ts is None or price is None:
             return
-
-        self._ticker_stats[sym] = {
-            "h": _parse_float(clean.get("h")),
-            "l": _parse_float(clean.get("l")),
-            "o": _parse_float(clean.get("o")),
-            "c": price,
-        }
-
-        if sym not in self._seeded:
+        if self._eligible_symbols and sym not in self._eligible_symbols:
             return
 
-        closed, current = self._update_bar(sym, ts, price, _parse_float(clean.get("Q")) or 0.0)
+        self._ticker_stats[sym] = ev
 
-        if closed:
-            self._market_store.update_candle(sym, closed, is_new=True)
-            self._bar_history.setdefault(sym, []).append(closed)
-            self._process_bar(sym)
-            self._market_store.update_candle(sym, current, is_new=True)
-            self._live_initialized.add(sym)
-        else:
-            if sym not in self._live_initialized:
-                self._market_store.update_candle(sym, current, is_new=True)
-                self._live_initialized.add(sym)
-            else:
-                self._market_store.update_candle(sym, current, is_new=False)
+    def _handle_trade(self, trade: AggTradeEvent) -> None:
+        self.metrics.ingest_trade(
+            trade.symbol,
+            trade.price,
+            trade.qty,
+            trade.event_time_ms,
+        )
 
-    def _refresh_watchlist(self) -> None:
-        if not self._ticker_stats:
-            return
-        scored: List[tuple[str, float]] = []
-        for sym, stats in self._ticker_stats.items():
-            high = stats.get("h")
-            low = stats.get("l")
-            if high is None or low is None or low <= 0:
-                continue
-            hl_diff = (high - low) / low
-            scored.append((sym, hl_diff))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        top_symbols = [sym for sym, _ in scored[:5]]
-        self._watchlist = set(top_symbols)
+    def _update_tick(self) -> None:
+        tick_sec = int(time.time())
+        self.latest_global_sample = self.metrics.finalize_tick(tick_sec)
 
-        for sym in top_symbols:
-            if sym in self._seeded:
-                continue
-            self._seed_symbol(sym)
+        market_dir = 0.0
+        if self.latest_global_sample.Fbar > 0:
+            market_dir = 1.0
+        elif self.latest_global_sample.Fbar < 0:
+            market_dir = -1.0
 
-    def _seed_symbol(self, sym: str) -> None:
-        stats = self._ticker_stats.get(sym)
-        if stats is None:
-            return
-        end_time = int(time.time() * 1000) - 1
-        candles = self._fetch_seed_candles(sym, end_time)
-        if not candles:
-            return
-        history = self._bar_history.setdefault(sym, [])
-        for candle in candles:
-            history.append(candle)
-            self._market_store.update_candle(sym, candle, is_new=True)
-        if len(history) > CANDLE_COUNT:
-            del history[:-CANDLE_COUNT]
+        now_sec = time.time()
+        self.latest_screening = self.screener.evaluate(self._ticker_stats, market_dir, now_sec)
+        self.kline_tracker.set_symbols(self.latest_screening.promoted)
 
-        last_close = candles[-1].get("c")
-        live_price = stats.get("c") if stats else None
-        price = live_price if live_price is not None else last_close
-        if price is None:
-            return
-        now_ms = int(time.time() * 1000)
-        bucket = int(now_ms // BAR_INTERVAL_MS)
-        live_state = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=0.0, ts=now_ms)
-        self._bars[sym] = live_state
-        live_candle = _state_to_candle(live_state)
-        self._market_store.update_candle(sym, live_candle, is_new=True)
-        self._live_initialized.add(sym)
-
-        self._seeded.add(sym)
-
-    def _fetch_seed_candles(self, sym: str, end_time_ms: int) -> List[dict]:
-        try:
-            params = {
-                "symbol": sym,
-                "interval": "1m",
-                "limit": CANDLE_COUNT - 1,
-                "endTime": end_time_ms,
-            }
-            resp = requests.get(REST_KLINES_URL, params=params, timeout=5)
-            resp.raise_for_status()
-            data = resp.json()
-            candles: List[dict] = []
-            for entry in data:
-                candles.append(
-                    {
-                        "t": int(entry[0]),
-                        "o": float(entry[1]),
-                        "h": float(entry[2]),
-                        "l": float(entry[3]),
-                        "c": float(entry[4]),
-                        "v": float(entry[5]),
-                    }
-                )
-            return candles
-        except Exception as exc:
-            logger.warning("Failed to seed candles for %s: %s", sym, exc)
-            return []
-
-    def _update_bar(self, sym: str, ts: int, price: float, qty: float) -> Tuple[Optional[dict], dict]:
-        bucket = int(ts // BAR_INTERVAL_MS)
-        state = self._bars.get(sym)
-        if state is None:
-            state = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=qty, ts=ts)
-            self._bars[sym] = state
-            return None, _state_to_candle(state)
-
-        if bucket == state.bucket:
-            state.h = max(state.h, price)
-            state.l = min(state.l, price)
-            state.c = price
-            state.v += qty
-            state.ts = ts
-            return None, _state_to_candle(state)
-
-        closed = _state_to_candle(state)
-        new_state = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=qty, ts=ts)
-        self._bars[sym] = new_state
-        return closed, _state_to_candle(new_state)
-
-    def _process_bar(self, sym: str) -> None:
-        history = self._bar_history.get(sym, [])
-        if not history:
-            return
-
-        df = pd.DataFrame(history)
-        df.sort_values("t", inplace=True)
-        df.reset_index(drop=True, inplace=True)
-
-        df["rsi"] = ta.rsi(df["c"], length=14)
-        macd = ta.macd(df["c"], fast=12, slow=26, signal=9)
-        if macd is not None:
-            df = pd.concat([df, macd], axis=1)
-        df["atr"] = ta.atr(df["h"], df["l"], df["c"], length=14)
-
-        latest = df.iloc[-1]
-        processed = {
-            "sym": sym,
-            "t": int(latest["t"]),
-            "o": _safe_float(latest.get("o")),
-            "h": _safe_float(latest.get("h")),
-            "l": _safe_float(latest.get("l")),
-            "c": _safe_float(latest.get("c")),
-            "v": _safe_float(latest.get("v")),
-            "rsi": _safe_float(latest.get("RSI_14")),
-            "macd": _safe_float(latest.get("MACD_12_26_9")),
-            "macd_signal": _safe_float(latest.get("MACDs_12_26_9")),
-            "macd_hist": _safe_float(latest.get("MACDh_12_26_9")),
-            "atr": _safe_float(latest.get("ATRr_14")) or _safe_float(latest.get("ATR_14")),
-        }
-
-        self._processed_buffer.append(processed)
-        self._producer.send(PROCESSED_TOPIC, key=sym, value=processed)
-
-        if len(history) > CANDLE_COUNT:
-            del history[:-CANDLE_COUNT]
-
-    def _update_snapshot(self) -> None:
-        now_ms = int(time.time() * 1000)
-        snapshot = self._market_store.compute_snapshot(now_ms)
-        with self._lock:
-            self.latest_snapshot = snapshot
-
-    def _flush_buffers_if_needed(self) -> None:
-        now = time.monotonic()
-        if (len(self._raw_buffer) >= RAW_FLUSH_SIZE) or (now - self._last_flush >= FLUSH_INTERVAL_SEC):
-            if self._raw_buffer:
-                _write_parquet(RAW_STORE_DIR, "raw", self._raw_buffer)
-                self._raw_buffer = []
-            if self._processed_buffer:
-                _write_parquet(PROCESSED_STORE_DIR, "processed", self._processed_buffer)
-                self._processed_buffer = []
-            self._last_flush = now
-
-
-def _state_to_candle(state: BarState) -> dict:
-    return {
-        "t": state.bucket * BAR_INTERVAL_MS,
-        "o": state.o,
-        "h": state.h,
-        "l": state.l,
-        "c": state.c,
-        "v": state.v,
-    }
-
-
-def _write_parquet(base_dir: Path, prefix: str, records: List[dict]) -> None:
-    if not records:
-        return
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    date_dir = base_dir / datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    date_dir.mkdir(parents=True, exist_ok=True)
-    path = date_dir / f"{prefix}_{timestamp}.parquet"
-    df = pd.DataFrame(records)
-    df.to_parquet(path, index=False)
+        if now_sec - self._last_screen_log >= LOG_SCREENING_EVERY_SEC:
+            self._last_screen_log = now_sec
+            promoted = list(self.latest_screening.promoted)
+            top_candidates = [
+                f"{c.symbol}:{c.score:.3f}" for c in self.latest_screening.candidates[:LOG_CANDIDATE_LIMIT]
+            ]
+            logger.info("Promoted: %s", promoted)
+            logger.info("Candidates (top %s): %s", LOG_CANDIDATE_LIMIT, top_candidates)
 
 
 def _parse_float(value: Any) -> Optional[float]:
     try:
+        if value is None:
+            return None
         return float(value)
     except (TypeError, ValueError):
         return None
-
-
-def _safe_float(value: Any) -> Optional[float]:
-    try:
-        if value is None:
-            return None
-        val = float(value)
-        if pd.isna(val):
-            return None
-        return val
-    except (TypeError, ValueError):
-        return None
-
-
-def _strip_additional_properties(value: Any) -> Any:
-    if isinstance(value, dict):
-        cleaned = {}
-        for key, val in value.items():
-            if key == "additional_properties":
-                continue
-            cleaned[key] = _strip_additional_properties(val)
-        return cleaned
-    if isinstance(value, list):
-        return [_strip_additional_properties(item) for item in value]
-    return value
