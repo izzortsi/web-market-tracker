@@ -39,6 +39,11 @@ from ..config import (
     AGG_TRADE_RECONNECT_SEC,
     LOG_SCREENING_EVERY_SEC,
     LOG_CANDIDATE_LIMIT,
+    PAPER_TRADING_ENABLED,
+    PAPER_START_EQUITY,
+    PAPER_MAX_TOTAL_PCT,
+    PAPER_MAX_SYMBOL_PCT,
+    PAPER_MIN_ACTIVE_BANDS,
 )
 from .agg_trade_streams import AggTradeStreamManager, AggTradeEvent
 from .global_metrics import GlobalMetricEngine, GlobalMetricSample
@@ -46,6 +51,7 @@ from .volatility import VolatilityService
 from .screener import Screener, ScreeningResult
 from .kline_tracker import KlineTrackerManager
 from .universe import UniverseManager
+from .paper_trading import PaperTradingEngine
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +110,16 @@ class ProcessorService:
         self.latest_global_sample: Optional[GlobalMetricSample] = None
         self.latest_screening: Optional[ScreeningResult] = None
         self._last_screen_log = 0.0
+
+        self.paper = None
+        if PAPER_TRADING_ENABLED:
+            self.paper = PaperTradingEngine(
+                starting_equity=PAPER_START_EQUITY,
+                max_total_pct=PAPER_MAX_TOTAL_PCT,
+                max_symbol_pct=PAPER_MAX_SYMBOL_PCT,
+                band_multiples=KELTNER_MULTIPLES,
+                min_active_bands=PAPER_MIN_ACTIVE_BANDS,
+            )
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -255,6 +271,14 @@ class ProcessorService:
         self.latest_screening = self.screener.evaluate(self._ticker_stats, market_dir, now_sec)
         self.kline_tracker.set_symbols(self.latest_screening.promoted)
 
+        if self.paper:
+            symbol_states = self.kline_tracker.get_all_states()
+            self.paper.update(
+                promoted_symbols=list(self.latest_screening.promoted),
+                symbol_states={s: _state_to_dict(st) for s, st in symbol_states.items()},
+                market_dir=market_dir,
+            )
+
         if now_sec - self._last_screen_log >= LOG_SCREENING_EVERY_SEC:
             self._last_screen_log = now_sec
             promoted = list(self.latest_screening.promoted)
@@ -263,6 +287,38 @@ class ProcessorService:
             ]
             logger.info("Promoted: %s", promoted)
             logger.info("Candidates (top %s): %s", LOG_CANDIDATE_LIMIT, top_candidates)
+
+
+def _state_to_dict(state) -> dict:
+    keltner = None
+    if state.keltner:
+        keltner = {
+            "basis": state.keltner.basis,
+            "atr": state.keltner.atr,
+            "multiples": {
+                str(k): {"lower": v[0], "upper": v[1]}
+                for k, v in state.keltner.multiples.items()
+            },
+        }
+    return {
+        "symbol": state.symbol,
+        "interval": state.interval,
+        "updated_at_ms": state.updated_at_ms,
+        "klines": [
+            {
+                "t": k.open_time,
+                "T": k.close_time,
+                "o": k.open,
+                "h": k.high,
+                "l": k.low,
+                "c": k.close,
+                "v": k.volume,
+                "x": k.is_closed,
+            }
+            for k in state.klines
+        ],
+        "keltner": keltner,
+    }
 
 
 def _parse_float(value: Any) -> Optional[float]:

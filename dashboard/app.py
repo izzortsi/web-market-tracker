@@ -10,6 +10,9 @@ API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 GLOBAL_URL = f"{API_BASE}/api/global/metrics"
 CANDIDATES_URL = f"{API_BASE}/api/screener/candidates"
 PROMOTED_URL = f"{API_BASE}/api/screener/promoted"
+PAPER_SUMMARY_URL = f"{API_BASE}/api/paper/summary"
+PAPER_POSITIONS_URL = f"{API_BASE}/api/paper/positions"
+PAPER_TRADES_URL = f"{API_BASE}/api/paper/trades"
 
 app = Dash(__name__)
 app.title = "Market Tracker"
@@ -171,6 +174,81 @@ def _promoted_card(symbol: str, state: Optional[Dict[str, Any]]) -> html.Div:
     )
 
 
+def _paper_summary_view(summary: Optional[Dict[str, Any]]) -> html.Div:
+    if summary is None:
+        return html.Div("Paper trading disabled or no data", className="card")
+    return html.Div(
+        className="card",
+        children=[
+            html.Div("Paper Trading Summary", className="card-header"),
+            html.Div(
+                className="stats",
+                children=[
+                    html.Span(f"Equity: {summary.get('equity', 0):.2f}"),
+                    html.Span(f"Positions: {summary.get('positions', 0)}"),
+                    html.Span(f"Orders: {summary.get('orders', 0)}"),
+                    html.Span(f"Trades: {summary.get('trades', 0)}"),
+                ],
+            ),
+        ],
+    )
+
+
+def _positions_table(positions: List[Dict[str, Any]]) -> html.Table:
+    if not positions:
+        return html.Table([html.Tbody([html.Tr([html.Td("No positions")])])], className="candidate-table")
+    header = html.Tr(
+        [
+            html.Th("Symbol"),
+            html.Th("Qty"),
+            html.Th("Avg Price"),
+            html.Th("Realized PnL"),
+        ]
+    )
+    rows = []
+    for p in positions:
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(p.get("symbol")),
+                    html.Td(f'{p.get("qty", 0):.6f}'),
+                    html.Td(f'{p.get("avg_price", 0):.6f}'),
+                    html.Td(f'{p.get("realized_pnl", 0):.2f}'),
+                ]
+            )
+        )
+    return html.Table([html.Thead(header), html.Tbody(rows)], className="candidate-table")
+
+
+def _trades_table(trades: List[Dict[str, Any]]) -> html.Table:
+    if not trades:
+        return html.Table([html.Tbody([html.Tr([html.Td("No trades")])])], className="candidate-table")
+    header = html.Tr(
+        [
+            html.Th("Time"),
+            html.Th("Symbol"),
+            html.Th("Side"),
+            html.Th("Qty"),
+            html.Th("Price"),
+        ]
+    )
+    rows = []
+    for t in trades:
+        ts = t.get("ts_ms", 0)
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(datetime.fromtimestamp(ts / 1000).strftime("%H:%M:%S")),
+                    html.Td(t.get("symbol")),
+                    html.Td(t.get("side")),
+                    html.Td(f'{t.get("qty", 0):.6f}'),
+                    html.Td(f'{t.get("price", 0):.6f}'),
+                ]
+            )
+        )
+    return html.Table([html.Thead(header), html.Tbody(rows)], className="candidate-table")
+
+
 app.layout = html.Div(
     className="page",
     children=[
@@ -205,6 +283,20 @@ app.layout = html.Div(
                 html.Div(id="promoted-cards", className="cards"),
             ],
         ),
+        html.Div(
+            className="section",
+            children=[
+                html.H3("Paper Trading"),
+                html.Div(id="paper-summary"),
+                html.Div(
+                    className="paper-tables",
+                    children=[
+                        html.Div([html.H4("Positions"), html.Div(id="paper-positions")]),
+                        html.Div([html.H4("Recent Trades"), html.Div(id="paper-trades")]),
+                    ],
+                ),
+            ],
+        ),
     ],
 )
 
@@ -214,19 +306,29 @@ app.layout = html.Div(
     Output("fbar", "figure"),
     Output("candidate-table", "children"),
     Output("promoted-cards", "children"),
+    Output("paper-summary", "children"),
+    Output("paper-positions", "children"),
+    Output("paper-trades", "children"),
     Input("refresh", "n_intervals"),
 )
 def update_dashboard(_: int):
     global_data = _safe_get(GLOBAL_URL)
     candidates_data = _safe_get(CANDIDATES_URL)
     promoted_data = _safe_get(PROMOTED_URL)
+    paper_summary = _safe_get(PAPER_SUMMARY_URL)
+    paper_positions = _safe_get(PAPER_POSITIONS_URL)
+    paper_trades = _safe_get(PAPER_TRADES_URL)
 
     if global_data is None:
+        empty = html.Div("API unreachable", className="card")
         return (
             _empty_figure("Aggregate Momentum (P̄)", "#00c896"),
             _empty_figure("Aggregate Force (F̄)", "#ff6b6b"),
-            html.Div("API unreachable"),
-            [html.Div("API unreachable", className="card")],
+            empty,
+            [empty],
+            empty,
+            empty,
+            empty,
         )
 
     series = global_data.get("series", [])
@@ -244,11 +346,14 @@ def update_dashboard(_: int):
     for sym in promoted:
         state = _safe_get(f"{API_BASE}/api/symbols/{sym}")
         cards.append(_promoted_card(sym, state))
-
     if not cards:
         cards = [html.Div("No promoted symbols", className="card")]
 
-    return pbar_fig, fbar_fig, candidate_table, cards
+    paper_summary_view = _paper_summary_view(paper_summary)
+    positions_view = _positions_table((paper_positions or {}).get("positions", []) if paper_positions else [])
+    trades_view = _trades_table((paper_trades or {}).get("trades", []) if paper_trades else [])
+
+    return pbar_fig, fbar_fig, candidate_table, cards, paper_summary_view, positions_view, trades_view
 
 
 if __name__ == "__main__":

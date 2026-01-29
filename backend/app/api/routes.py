@@ -54,3 +54,56 @@ async def get_symbol_state(symbol: str, request: Request):
             return JSONResponse({"message": "warming up"}, status_code=status.HTTP_202_ACCEPTED)
         return JSONResponse({"message": "not tracked"}, status_code=status.HTTP_404_NOT_FOUND)
     return state
+
+
+@router.get("/api/paper/summary")
+async def get_paper_summary(request: Request):
+    processor = _get_processor(request)
+    if processor is None or processor.paper is None:
+        return JSONResponse({"message": "paper trading disabled"}, status_code=status.HTTP_404_NOT_FOUND)
+    ledger = processor.paper.ledger
+    return {
+        "equity": ledger.total_equity(),
+        "positions": len(ledger.positions),
+        "orders": len(ledger.orders),
+        "trades": len(ledger.trades),
+    }
+
+
+@router.get("/api/paper/positions")
+async def get_paper_positions(request: Request):
+    processor = _get_processor(request)
+    if processor is None or processor.paper is None:
+        return JSONResponse({"message": "paper trading disabled"}, status_code=status.HTTP_404_NOT_FOUND)
+    positions = []
+    for pos in processor.paper.ledger.positions.values():
+        positions.append(
+            {
+                "symbol": pos.symbol,
+                "qty": pos.qty,
+                "avg_price": pos.avg_price,
+                "realized_pnl": pos.realized_pnl,
+            }
+        )
+    return {"positions": positions}
+
+
+@router.get("/api/paper/trades")
+async def get_paper_trades(request: Request):
+    processor = _get_processor(request)
+    if processor is None or processor.paper is None:
+        return JSONResponse({"message": "paper trading disabled"}, status_code=status.HTTP_404_NOT_FOUND)
+    trades = []
+    for t in processor.paper.ledger.trades[-200:]:
+        trades.append(
+            {
+                "trade_id": t.trade_id,
+                "order_id": t.order_id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "qty": t.qty,
+                "price": t.price,
+                "ts_ms": t.ts_ms,
+            }
+        )
+    return {"trades": trades}
