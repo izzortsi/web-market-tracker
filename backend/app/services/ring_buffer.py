@@ -27,5 +27,12 @@ class RingBuffer(Generic[T]):
                 result.append(value)
         return result
 
+    def update_last(self, item: T) -> None:
+        if self._count == 0:
+            self.push(item)
+            return
+        last_index = (self._idx - 1) % self._size
+        self._buf[last_index] = item
+
     def length(self) -> int:
         return self._count

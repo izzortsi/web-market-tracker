@@ -4,57 +4,33 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BACKEND_DIR="$ROOT_DIR/backend"
 DASHBOARD_DIR="$ROOT_DIR/dashboard"
+SESSION_NAME="web-market-tracker"
 
-find_terminal() {
-  if command -v gnome-terminal >/dev/null 2>&1; then
-    echo "gnome-terminal"
-  elif command -v konsole >/dev/null 2>&1; then
-    echo "konsole"
-  elif command -v xfce4-terminal >/dev/null 2>&1; then
-    echo "xfce4-terminal"
-  elif command -v xterm >/dev/null 2>&1; then
-    echo "xterm"
-  else
-    echo ""
-  fi
-}
-
-TERMINAL_BIN="$(find_terminal)"
-if [[ -z "$TERMINAL_BIN" ]]; then
-  echo "No supported terminal emulator found (gnome-terminal/konsole/xfce4-terminal/xterm)."
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "tmux is required but not installed."
   exit 1
 fi
 
-run_term() {
-  local title="$1"
-  local cmd="$2"
+if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
+  echo "tmux session '$SESSION_NAME' already exists. Attach with: tmux attach -t $SESSION_NAME"
+  exit 1
+fi
 
-  case "$TERMINAL_BIN" in
-    gnome-terminal)
-      gnome-terminal --window --title="$title" -- bash -lc "$cmd; exec bash" &
-      ;;
-    konsole)
-      konsole --title="$title" -e bash -lc "$cmd; exec bash" &
-      ;;
-    xfce4-terminal)
-      xfce4-terminal --disable-server --title="$title" --command "bash -lc \"$cmd; exec bash\"" &
-      ;;
-    xterm)
-      xterm -T "$title" -e bash -lc "$cmd; exec bash" &
-      ;;
-    *)
-      echo "Unsupported terminal: $TERMINAL_BIN"
-      exit 1
-      ;;
-  esac
-}
+pane_kafka="$(tmux new-session -d -s "$SESSION_NAME" -c "$ROOT_DIR" -P -F "#{pane_id}")"
 
-run_term "Kafka" "cd \"$BACKEND_DIR\" && sudo ./run_kafka.sh"
-sleep 7.5
-run_term "Ingest" "cd \"$BACKEND_DIR\" && eval \"\$(micromamba shell hook -s bash)\" && micromamba activate bot && ./run_ingest.sh"
-sleep 2.5
-run_term "API" "cd \"$BACKEND_DIR\" && eval \"\$(micromamba shell hook -s bash)\" && micromamba activate bot && ./run_api.sh"
-sleep 2.5
-run_term "Dash" "cd \"$DASHBOARD_DIR\" && eval \"\$(micromamba shell hook -s bash)\" && micromamba activate bot && ./run_dash.sh"
+# Pane 2: Ingest
+pane_ingest="$(tmux split-window -h -t "$pane_kafka" -P -F "#{pane_id}")"
 
-echo "Started Kafka, ingest, API, and Dash in separate terminals."
+# Pane 3: API
+pane_api="$(tmux split-window -v -t "$pane_kafka" -P -F "#{pane_id}")"
+
+# Pane 4: Dash
+pane_dash="$(tmux split-window -v -t "$pane_ingest" -P -F "#{pane_id}")"
+
+tmux send-keys -t "$pane_kafka" "cd \"$BACKEND_DIR\" && sudo ./run_kafka.sh" C-m
+tmux send-keys -t "$pane_ingest" "cd \"$BACKEND_DIR\" && eval \"\$(micromamba shell hook -s bash)\" && micromamba activate bot && sleep 8 && ./run_ingest.sh" C-m
+tmux send-keys -t "$pane_api" "cd \"$BACKEND_DIR\" && eval \"\$(micromamba shell hook -s bash)\" && micromamba activate bot && sleep 8 && ./run_api.sh" C-m
+tmux send-keys -t "$pane_dash" "cd \"$DASHBOARD_DIR\" && eval \"\$(micromamba shell hook -s bash)\" && micromamba activate bot && sleep 8 && ./run_dash.sh" C-m
+
+tmux select-layout -t "$SESSION_NAME":0 tiled
+tmux attach -t "$SESSION_NAME"

@@ -21,6 +21,7 @@ def _empty_figure(title: str, color: str) -> go.Figure:
         paper_bgcolor="#111c2b",
         plot_bgcolor="#111c2b",
         font=dict(color="#e6edf3"),
+        uirevision="market-tracker",
     )
     return fig
 
@@ -66,7 +67,15 @@ def _candlestick_figure(ohlc: List[Dict[str, Any]]) -> go.Figure:
         paper_bgcolor="#111c2b",
         plot_bgcolor="#111c2b",
         font=dict(color="#e6edf3"),
-        xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+        uirevision="market-tracker",
+        xaxis=dict(
+            showgrid=False,
+            showticklabels=True,
+            tickformat="%H:%M",
+            nticks=5,
+            rangeslider=dict(visible=False),
+            zeroline=False,
+        ),
         yaxis=dict(showgrid=True, zeroline=False),
     )
     return fig
@@ -87,8 +96,16 @@ app.layout = html.Div(
         html.Div(
             className="metrics",
             children=[
-                dcc.Graph(id="momentum", figure=_empty_figure("Aggregate Momentum", "#00c896")),
-                dcc.Graph(id="accel", figure=_empty_figure("Aggregate Acceleration", "#ff6b6b")),
+                dcc.Graph(
+                    id="momentum",
+                    figure=_empty_figure("Aggregate Momentum", "#00c896"),
+                    config={"displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["resetScale2d"]},
+                ),
+                dcc.Graph(
+                    id="accel",
+                    figure=_empty_figure("Aggregate Acceleration", "#ff6b6b"),
+                    config={"displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["resetScale2d"]},
+                ),
             ],
         ),
         html.Div(
@@ -213,7 +230,10 @@ def update_dashboard(_: int, order_by: str, order_dir: str, filter_by: str):
                         ],
                     ),
                     stats,
-                    dcc.Graph(figure=_candlestick_figure(sym["ohlc"]), config={"displayModeBar": False}),
+                    dcc.Graph(
+                        figure=_candlestick_figure(sym["ohlc"]),
+                        config={"displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["resetScale2d"]},
+                    ),
                 ],
             )
         )

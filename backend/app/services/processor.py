@@ -7,10 +7,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import pandas as pd
 import pandas_ta as ta
+import requests
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 
@@ -18,7 +19,6 @@ from ..config import (
     BAR_INTERVAL_SEC,
     FLUSH_INTERVAL_SEC,
     KAFKA_BROKER,
-    MAX_SERIES_POINTS,
     PROCESSED_FLUSH_SIZE,
     PROCESSED_STORE_DIR,
     PROCESSED_TOPIC,
@@ -28,12 +28,14 @@ from ..config import (
     RAW_TOPIC,
     RAW_TOPIC_PARTITIONS,
     SNAPSHOT_INTERVAL_SEC,
+    CANDLE_COUNT,
 )
 from .market_store import MarketStore
 
 logger = logging.getLogger(__name__)
 
 BAR_INTERVAL_MS = BAR_INTERVAL_SEC * 1000
+REST_KLINES_URL = "https://fapi.binance.com/fapi/v1/klines"
 
 
 @dataclass
@@ -57,6 +59,11 @@ class ProcessorService:
         self._market_store = MarketStore({})
         self._bars: Dict[str, BarState] = {}
         self._bar_history: Dict[str, List[dict]] = {}
+        self._seeded: set[str] = set()
+        self._live_initialized: set[str] = set()
+        self._watchlist: set[str] = set()
+        self._ticker_stats: Dict[str, dict] = {}
+        self._last_watchlist_refresh = time.monotonic()
 
         self._raw_buffer: List[dict] = []
         self._processed_buffer: List[dict] = []
@@ -100,12 +107,6 @@ class ProcessorService:
         now_ms = int(time.time() * 1000)
         return self._market_store.compute_snapshot(now_ms)
 
-    def get_snapshot(self) -> dict:
-        if self.latest_snapshot is not None:
-            return self.latest_snapshot
-        now_ms = int(time.time() * 1000)
-        return self._market_store.compute_snapshot(now_ms)
-
     def _ensure_topics(self) -> None:
         admin = KafkaAdminClient(bootstrap_servers=KAFKA_BROKER)
         existing = {topic for topic in admin.list_topics()}
@@ -138,6 +139,10 @@ class ProcessorService:
                     logger.warning("No raw messages received for >10s (raw topic: %s)", RAW_TOPIC)
                     self._last_message_time = now
 
+                if now - self._last_watchlist_refresh > 5:
+                    self._refresh_watchlist()
+                    self._last_watchlist_refresh = now
+
                 if now >= next_snapshot:
                     self._update_snapshot()
                     next_snapshot = now + SNAPSHOT_INTERVAL_SEC
@@ -150,49 +155,141 @@ class ProcessorService:
     def _handle_raw_event(self, ev: dict) -> None:
         clean = _strip_additional_properties(ev)
         self._raw_buffer.append(clean)
-        self._market_store.ingest([clean])
-        closed_bar = self._update_bar(clean)
-        if closed_bar:
-            self._process_bar(closed_bar)
 
-    def _update_bar(self, ev: dict) -> Optional[dict]:
-        sym = ev.get("s")
-        ts = ev.get("E")
-        price = _parse_float(ev.get("c"))
-        qty = _parse_float(ev.get("Q")) or 0.0
+        sym = clean.get("s")
+        ts = clean.get("E")
+        price = _parse_float(clean.get("c"))
         if sym is None or ts is None or price is None:
-            return None
+            return
+
+        self._ticker_stats[sym] = {
+            "h": _parse_float(clean.get("h")),
+            "l": _parse_float(clean.get("l")),
+            "o": _parse_float(clean.get("o")),
+            "c": price,
+        }
+
+        if sym not in self._seeded:
+            return
+
+        closed, current = self._update_bar(sym, ts, price, _parse_float(clean.get("Q")) or 0.0)
+
+        if closed:
+            self._market_store.update_candle(sym, closed, is_new=True)
+            self._bar_history.setdefault(sym, []).append(closed)
+            self._process_bar(sym)
+            self._market_store.update_candle(sym, current, is_new=True)
+            self._live_initialized.add(sym)
+        else:
+            if sym not in self._live_initialized:
+                self._market_store.update_candle(sym, current, is_new=True)
+                self._live_initialized.add(sym)
+            else:
+                self._market_store.update_candle(sym, current, is_new=False)
+
+    def _refresh_watchlist(self) -> None:
+        if not self._ticker_stats:
+            return
+        scored: List[tuple[str, float]] = []
+        for sym, stats in self._ticker_stats.items():
+            high = stats.get("h")
+            low = stats.get("l")
+            if high is None or low is None or low <= 0:
+                continue
+            hl_diff = (high - low) / low
+            scored.append((sym, hl_diff))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_symbols = [sym for sym, _ in scored[:5]]
+        self._watchlist = set(top_symbols)
+
+        for sym in top_symbols:
+            if sym in self._seeded:
+                continue
+            self._seed_symbol(sym)
+
+    def _seed_symbol(self, sym: str) -> None:
+        stats = self._ticker_stats.get(sym)
+        if stats is None:
+            return
+        end_time = int(time.time() * 1000) - 1
+        candles = self._fetch_seed_candles(sym, end_time)
+        if not candles:
+            return
+        history = self._bar_history.setdefault(sym, [])
+        for candle in candles:
+            history.append(candle)
+            self._market_store.update_candle(sym, candle, is_new=True)
+        if len(history) > CANDLE_COUNT:
+            del history[:-CANDLE_COUNT]
+
+        last_close = candles[-1].get("c")
+        live_price = stats.get("c") if stats else None
+        price = live_price if live_price is not None else last_close
+        if price is None:
+            return
+        now_ms = int(time.time() * 1000)
+        bucket = int(now_ms // BAR_INTERVAL_MS)
+        live_state = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=0.0, ts=now_ms)
+        self._bars[sym] = live_state
+        live_candle = _state_to_candle(live_state)
+        self._market_store.update_candle(sym, live_candle, is_new=True)
+        self._live_initialized.add(sym)
+
+        self._seeded.add(sym)
+
+    def _fetch_seed_candles(self, sym: str, end_time_ms: int) -> List[dict]:
+        try:
+            params = {
+                "symbol": sym,
+                "interval": "1m",
+                "limit": CANDLE_COUNT - 1,
+                "endTime": end_time_ms,
+            }
+            resp = requests.get(REST_KLINES_URL, params=params, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            candles: List[dict] = []
+            for entry in data:
+                candles.append(
+                    {
+                        "t": int(entry[0]),
+                        "o": float(entry[1]),
+                        "h": float(entry[2]),
+                        "l": float(entry[3]),
+                        "c": float(entry[4]),
+                        "v": float(entry[5]),
+                    }
+                )
+            return candles
+        except Exception as exc:
+            logger.warning("Failed to seed candles for %s: %s", sym, exc)
+            return []
+
+    def _update_bar(self, sym: str, ts: int, price: float, qty: float) -> Tuple[Optional[dict], dict]:
         bucket = int(ts // BAR_INTERVAL_MS)
         state = self._bars.get(sym)
         if state is None:
-            self._bars[sym] = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=qty, ts=ts)
-            return None
+            state = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=qty, ts=ts)
+            self._bars[sym] = state
+            return None, _state_to_candle(state)
+
         if bucket == state.bucket:
             state.h = max(state.h, price)
             state.l = min(state.l, price)
             state.c = price
             state.v += qty
             state.ts = ts
-            return None
+            return None, _state_to_candle(state)
 
-        closed = {
-            "sym": sym,
-            "t": state.bucket * BAR_INTERVAL_MS,
-            "o": state.o,
-            "h": state.h,
-            "l": state.l,
-            "c": state.c,
-            "v": state.v,
-        }
-        self._bars[sym] = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=qty, ts=ts)
-        return closed
+        closed = _state_to_candle(state)
+        new_state = BarState(bucket=bucket, o=price, h=price, l=price, c=price, v=qty, ts=ts)
+        self._bars[sym] = new_state
+        return closed, _state_to_candle(new_state)
 
-    def _process_bar(self, bar: dict) -> None:
-        sym = bar["sym"]
-        history = self._bar_history.setdefault(sym, [])
-        history.append(bar)
-        if len(history) > 300:
-            history.pop(0)
+    def _process_bar(self, sym: str) -> None:
+        history = self._bar_history.get(sym, [])
+        if not history:
+            return
 
         df = pd.DataFrame(history)
         df.sort_values("t", inplace=True)
@@ -223,6 +320,9 @@ class ProcessorService:
         self._processed_buffer.append(processed)
         self._producer.send(PROCESSED_TOPIC, key=sym, value=processed)
 
+        if len(history) > CANDLE_COUNT:
+            del history[:-CANDLE_COUNT]
+
     def _update_snapshot(self) -> None:
         now_ms = int(time.time() * 1000)
         snapshot = self._market_store.compute_snapshot(now_ms)
@@ -239,6 +339,17 @@ class ProcessorService:
                 _write_parquet(PROCESSED_STORE_DIR, "processed", self._processed_buffer)
                 self._processed_buffer = []
             self._last_flush = now
+
+
+def _state_to_candle(state: BarState) -> dict:
+    return {
+        "t": state.bucket * BAR_INTERVAL_MS,
+        "o": state.o,
+        "h": state.h,
+        "l": state.l,
+        "c": state.c,
+        "v": state.v,
+    }
 
 
 def _write_parquet(base_dir: Path, prefix: str, records: List[dict]) -> None:
