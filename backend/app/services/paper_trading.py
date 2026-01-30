@@ -26,6 +26,7 @@ class PaperTrade:
     qty: float
     price: float
     ts_ms: int
+    realized_pnl: float = 0.0
 
 
 @dataclass
@@ -49,6 +50,7 @@ class PaperLedger:
             pos = PaperPosition(symbol=trade.symbol, qty=0.0, avg_price=0.0, realized_pnl=0.0)
 
         signed_qty = trade.qty if trade.side == "BUY" else -trade.qty
+        pnl_contrib = 0.0
 
         if pos.qty == 0:
             pos.qty = signed_qty
@@ -58,16 +60,16 @@ class PaperLedger:
             pos.avg_price = (pos.avg_price * abs(pos.qty) + trade.price * abs(signed_qty)) / max(abs(new_qty), 1e-9)
             pos.qty = new_qty
         else:
-            # Reducing or flipping
             closing_qty = min(abs(pos.qty), abs(signed_qty))
-            pnl = closing_qty * (trade.price - pos.avg_price) * (1 if pos.qty > 0 else -1)
-            pos.realized_pnl += pnl
+            pnl_contrib = closing_qty * (trade.price - pos.avg_price) * (1 if pos.qty > 0 else -1)
+            pos.realized_pnl += pnl_contrib
             pos.qty += signed_qty
             if pos.qty == 0:
                 pos.avg_price = 0.0
             else:
                 pos.avg_price = trade.price
 
+        trade.realized_pnl = pnl_contrib
         self.positions[trade.symbol] = pos
 
     def total_equity(self) -> float:
@@ -87,6 +89,25 @@ class PaperLedger:
         if pos is None:
             return 0.0
         return abs(pos.qty * price)
+
+    def positions_view(self, price_map: Dict[str, float]) -> List[Dict[str, float]]:
+        out: List[Dict[str, float]] = []
+        for pos in self.positions.values():
+            price = price_map.get(pos.symbol)
+            current_pnl = 0.0
+            if price is not None:
+                current_pnl = (price - pos.avg_price) * pos.qty
+            out.append(
+                {
+                    "symbol": pos.symbol,
+                    "qty": pos.qty,
+                    "avg_price": pos.avg_price,
+                    "realized_pnl": pos.realized_pnl,
+                    "current_pnl": current_pnl,
+                    "price": price,
+                }
+            )
+        return out
 
 
 class PaperTradingEngine:
@@ -148,12 +169,11 @@ class PaperTradingEngine:
 
             active_bands = _select_active_bands(multiples, self.band_multiples, self._active_band_count)
 
-            # Determine crossings
-            if market_dir < 0:  # market down, we short on upward band cross
+            if market_dir < 0:
                 crossed = _crossed_up(prev_price, price, active_bands)
                 if crossed is not None:
                     self._execute_trade(sym, "SELL", price, crossed)
-            elif market_dir > 0:  # market up, we long on downward band cross
+            elif market_dir > 0:
                 crossed = _crossed_down(prev_price, price, active_bands)
                 if crossed is not None:
                     self._execute_trade(sym, "BUY", price, crossed)
@@ -169,7 +189,6 @@ class PaperTradingEngine:
         if self.ledger.symbol_exposure(symbol, price) >= max_symbol:
             return
 
-        # size: allocate equal notional per active band
         notional = min(max_symbol - self.ledger.symbol_exposure(symbol, price), max_total - total_exposure)
         if notional <= 0:
             return
@@ -201,6 +220,24 @@ class PaperTradingEngine:
         self.ledger.orders.append(order)
         self.ledger.trades.append(trade)
         self.ledger.apply_trade(trade)
+
+    def positions_view(self) -> List[Dict[str, float]]:
+        return self.ledger.positions_view(self._last_price)
+
+    def trades_view(self) -> List[Dict[str, float]]:
+        return [
+            {
+                "trade_id": t.trade_id,
+                "order_id": t.order_id,
+                "symbol": t.symbol,
+                "side": t.side,
+                "qty": t.qty,
+                "price": t.price,
+                "ts_ms": t.ts_ms,
+                "realized_pnl": t.realized_pnl,
+            }
+            for t in self.ledger.trades[-200:]
+        ]
 
 
 def _select_active_bands(

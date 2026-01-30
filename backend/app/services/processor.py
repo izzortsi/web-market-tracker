@@ -162,17 +162,24 @@ class ProcessorService:
     def get_candidates(self) -> List[dict]:
         if self.latest_screening is None:
             return []
-        return [
-            {
-                "symbol": c.symbol,
-                "score": c.score,
-                "range_pos": c.range_pos,
-                "sigma_1m": c.sigma_1m,
-                "quote_volume_24h": c.quote_volume_24h,
-                "fee_threshold": c.fee_threshold,
-            }
-            for c in self.latest_screening.candidates
-        ]
+        candidates: List[dict] = []
+        for c in self.latest_screening.candidates:
+            stats = self._ticker_stats.get(c.symbol, {})
+            last_price = _parse_float(stats.get("c"))
+            price_change_pct = _parse_float(stats.get("P"))
+            candidates.append(
+                {
+                    "symbol": c.symbol,
+                    "score": c.score,
+                    "range_pos": c.range_pos,
+                    "sigma_1m": c.sigma_1m,
+                    "quote_volume_24h": c.quote_volume_24h,
+                    "fee_threshold": c.fee_threshold,
+                    "last_price": last_price,
+                    "price_change_pct": price_change_pct,
+                }
+            )
+        return candidates
 
     def get_promoted(self) -> List[str]:
         if self.latest_screening is None:

@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 import plotly.graph_objects as go
-from dash import Dash, dcc, html, Input, Output
+from dash import Dash, dcc, html, Input, Output, State
 
 API_BASE = os.environ.get("API_BASE", "http://localhost:8000")
 GLOBAL_URL = f"{API_BASE}/api/global/metrics"
@@ -108,7 +108,130 @@ def _series_from_global(samples: List[Dict[str, Any]], key: str) -> List[Dict[st
     return out
 
 
-def _candidate_table(candidates: List[Dict[str, Any]]) -> html.Table:
+def _sparkline(klines: List[Dict[str, Any]], height: int = 70) -> go.Figure:
+    if not klines:
+        fig = go.Figure()
+        fig.update_layout(
+            margin=dict(l=0, r=0, t=0, b=0),
+            height=height,
+            paper_bgcolor="#111c2b",
+            plot_bgcolor="#111c2b",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+        )
+        return fig
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=[datetime.fromtimestamp(o["t"] / 1000) for o in klines],
+            y=[o["c"] for o in klines],
+            mode="lines",
+            line=dict(color="#e6edf3", width=1),
+        )
+    )
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=height,
+        paper_bgcolor="#111c2b",
+        plot_bgcolor="#111c2b",
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+    )
+    return fig
+
+
+def _keltner_sparkline(klines: List[Dict[str, Any]], keltner: Optional[Dict[str, Any]], height: int = 80) -> go.Figure:
+    fig = _sparkline(klines, height=height)
+    if not keltner:
+        return fig
+    multiples = keltner.get("multiples") or {}
+    if not klines or not multiples:
+        return fig
+    x_vals = [datetime.fromtimestamp(o["t"] / 1000) for o in klines]
+    for _, band in multiples.items():
+        fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=[band["upper"]] * len(klines),
+                mode="lines",
+                line=dict(color="#ff6b6b", width=1, dash="dot"),
+                showlegend=False,
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x_vals,
+                y=[band["lower"]] * len(klines),
+                mode="lines",
+                line=dict(color="#00c896", width=1, dash="dot"),
+                showlegend=False,
+            )
+        )
+    return fig
+
+
+def _build_candidate_slots(
+    prev_slots: Optional[List[Optional[Dict[str, Any]]]],
+    candidates: List[Dict[str, Any]],
+) -> List[Optional[Dict[str, Any]]]:
+    slots: List[Optional[Dict[str, Any]]] = list(prev_slots or [])
+    slots = (slots + [None] * 10)[:10]
+
+    prev_symbols = {slot.get("symbol") for slot in slots if slot and slot.get("symbol")}
+    candidates_by_symbol = {c.get("symbol"): c for c in candidates if c.get("symbol")}
+
+    next_slots: List[Optional[Dict[str, Any]]] = []
+    for slot in slots:
+        sym = slot.get("symbol") if slot else None
+        if sym and sym in candidates_by_symbol:
+            next_slots.append(candidates_by_symbol[sym])
+        else:
+            next_slots.append(None)
+
+    new_candidates = [
+        c
+        for c in sorted(candidates, key=lambda c: c.get("score", 0), reverse=True)
+        if c.get("symbol") and c.get("symbol") not in prev_symbols
+    ]
+
+    new_iter = iter(new_candidates)
+    for i, slot in enumerate(next_slots):
+        if slot is None:
+            try:
+                next_slots[i] = next(new_iter)
+            except StopIteration:
+                break
+
+    return next_slots
+
+
+def _candidate_rows(slots: List[Optional[Dict[str, Any]]]) -> List[html.Tr]:
+    rows: List[html.Tr] = []
+    for c in slots[:10]:
+        if not c:
+            rows.append(html.Tr([html.Td("") for _ in range(8)]))
+            continue
+        last_price = c.get("last_price")
+        price_change_pct = c.get("price_change_pct")
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(c.get("symbol") or ""),
+                    html.Td(f'{c.get("score", 0):.4f}'),
+                    html.Td(f'{c.get("range_pos", 0):.4f}'),
+                    html.Td(f'{c.get("sigma_1m", 0):.6f}'),
+                    html.Td(f'{c.get("quote_volume_24h", 0):.2f}'),
+                    html.Td(f'{c.get("fee_threshold", 0):.6f}'),
+                    html.Td(f'{last_price:.6f}' if last_price is not None else ""),
+                    html.Td(f'{price_change_pct:.2f}%' if price_change_pct is not None else ""),
+                ]
+            )
+        )
+
+    while len(rows) < 10:
+        rows.append(html.Tr([html.Td("") for _ in range(8)]))
+
     header = html.Tr(
         [
             html.Th("Symbol"),
@@ -117,23 +240,38 @@ def _candidate_table(candidates: List[Dict[str, Any]]) -> html.Table:
             html.Th("σ(1m)"),
             html.Th("QuoteVol 24h"),
             html.Th("Fee Threshold"),
+            html.Th("Last"),
+            html.Th("24h %"),
         ]
     )
-    rows = []
-    for c in candidates:
-        rows.append(
-            html.Tr(
-                [
-                    html.Td(c.get("symbol")),
-                    html.Td(f'{c.get("score", 0):.4f}'),
-                    html.Td(f'{c.get("range_pos", 0):.4f}'),
-                    html.Td(f'{c.get("sigma_1m", 0):.6f}'),
-                    html.Td(f'{c.get("quote_volume_24h", 0):.2f}'),
-                    html.Td(f'{c.get("fee_threshold", 0):.6f}'),
-                ]
+    return [header, *rows]
+
+
+def _keltner_overlay(klines: List[Dict[str, Any]], keltner: Dict[str, Any]) -> go.Figure:
+    fig = _candlestick_figure(klines)
+    multiples = keltner.get("multiples") or {}
+    for k, band in multiples.items():
+        fig.add_trace(
+            go.Scatter(
+                x=[datetime.fromtimestamp(o["t"] / 1000) for o in klines],
+                y=[band["upper"]] * len(klines),
+                mode="lines",
+                line=dict(color="#ff6b6b", width=1, dash="dot"),
+                name=f"{k} upper",
+                showlegend=False,
             )
         )
-    return html.Table([html.Thead(header), html.Tbody(rows)], className="candidate-table")
+        fig.add_trace(
+            go.Scatter(
+                x=[datetime.fromtimestamp(o["t"] / 1000) for o in klines],
+                y=[band["lower"]] * len(klines),
+                mode="lines",
+                line=dict(color="#00c896", width=1, dash="dot"),
+                name=f"{k} lower",
+                showlegend=False,
+            )
+        )
+    return fig
 
 
 def _promoted_card(symbol: str, state: Optional[Dict[str, Any]]) -> html.Div:
@@ -144,9 +282,8 @@ def _promoted_card(symbol: str, state: Optional[Dict[str, Any]]) -> html.Div:
     keltner = state.get("keltner") or {}
     basis = keltner.get("basis")
     atr = keltner.get("atr")
-    multiples = keltner.get("multiples") or {}
 
-    band_text = ", ".join([f"{k}: [{v['lower']:.2f},{v['upper']:.2f}]" for k, v in multiples.items()])
+    fig = _keltner_overlay(klines, keltner)
 
     return html.Div(
         className="card",
@@ -163,11 +300,10 @@ def _promoted_card(symbol: str, state: Optional[Dict[str, Any]]) -> html.Div:
                 children=[
                     html.Span(f"Basis: {basis:.4f}" if basis is not None else "Basis: -"),
                     html.Span(f"ATR: {atr:.4f}" if atr is not None else "ATR: -"),
-                    html.Span(f"Bands: {band_text}" if band_text else "Bands: -"),
                 ],
             ),
             dcc.Graph(
-                figure=_candlestick_figure(klines),
+                figure=fig,
                 config={"displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["resetScale2d"]},
             ),
         ],
@@ -195,28 +331,37 @@ def _paper_summary_view(summary: Optional[Dict[str, Any]]) -> html.Div:
 
 
 def _positions_table(positions: List[Dict[str, Any]]) -> html.Table:
-    if not positions:
-        return html.Table([html.Tbody([html.Tr([html.Td("No positions")])])], className="candidate-table")
+    rows = []
+    for p in positions[:3]:
+        sym = p.get("symbol")
+        state = _safe_get(f"{API_BASE}/api/symbols/{sym}") if sym else None
+        spark = _keltner_sparkline(state.get("klines", []) if state else [], state.get("keltner", {}) if state else {})
+        rows.append(
+            html.Tr(
+                [
+                    html.Td(sym or ""),
+                    html.Td(f'{p.get("qty", 0):.6f}'),
+                    html.Td(f'{p.get("avg_price", 0):.6f}'),
+                    html.Td(f'{p.get("current_pnl", 0):.2f}'),
+                    html.Td(f'{p.get("realized_pnl", 0):.2f}'),
+                    html.Td(dcc.Graph(figure=spark, config={"displayModeBar": False}), style={"width": "160px"}),
+                ]
+            )
+        )
+
+    while len(rows) < 3:
+        rows.append(html.Tr([html.Td("") for _ in range(6)]))
+
     header = html.Tr(
         [
             html.Th("Symbol"),
             html.Th("Qty"),
             html.Th("Avg Price"),
+            html.Th("Current PnL"),
             html.Th("Realized PnL"),
+            html.Th("Price (Keltner)"),
         ]
     )
-    rows = []
-    for p in positions:
-        rows.append(
-            html.Tr(
-                [
-                    html.Td(p.get("symbol")),
-                    html.Td(f'{p.get("qty", 0):.6f}'),
-                    html.Td(f'{p.get("avg_price", 0):.6f}'),
-                    html.Td(f'{p.get("realized_pnl", 0):.2f}'),
-                ]
-            )
-        )
     return html.Table([html.Thead(header), html.Tbody(rows)], className="candidate-table")
 
 
@@ -230,6 +375,7 @@ def _trades_table(trades: List[Dict[str, Any]]) -> html.Table:
             html.Th("Side"),
             html.Th("Qty"),
             html.Th("Price"),
+            html.Th("Realized PnL"),
         ]
     )
     rows = []
@@ -243,6 +389,7 @@ def _trades_table(trades: List[Dict[str, Any]]) -> html.Table:
                     html.Td(t.get("side")),
                     html.Td(f'{t.get("qty", 0):.6f}'),
                     html.Td(f'{t.get("price", 0):.6f}'),
+                    html.Td(f'{t.get("realized_pnl", 0):.2f}'),
                 ]
             )
         )
@@ -254,6 +401,7 @@ app.layout = html.Div(
     children=[
         html.H1("Market Tracker"),
         dcc.Interval(id="refresh", interval=1000, n_intervals=0),
+        dcc.Store(id="candidate-cache", data=[]),
         html.Div(
             className="metrics",
             children=[
@@ -268,12 +416,13 @@ app.layout = html.Div(
                     config={"displayModeBar": True, "displaylogo": False, "modeBarButtonsToAdd": ["resetScale2d"]},
                 ),
             ],
+            style={"display": "grid", "gridTemplateColumns": "1fr 1fr", "gap": "8px"},
         ),
         html.Div(
             className="section",
             children=[
                 html.H3("Candidates"),
-                html.Div(id="candidate-table"),
+                html.Div(id="candidate-table", style={"minHeight": "320px"}),
             ],
         ),
         html.Div(
@@ -291,9 +440,10 @@ app.layout = html.Div(
                 html.Div(
                     className="paper-tables",
                     children=[
-                        html.Div([html.H4("Positions"), html.Div(id="paper-positions")]),
-                        html.Div([html.H4("Recent Trades"), html.Div(id="paper-trades")]),
+                        html.Div([html.H4("Positions"), html.Div(id="paper-positions")], style={"width": "62%"}),
+                        html.Div([html.H4("Recent Trades"), html.Div(id="paper-trades")], style={"width": "38%"}),
                     ],
+                    style={"display": "flex", "gap": "12px"},
                 ),
             ],
         ),
@@ -309,9 +459,11 @@ app.layout = html.Div(
     Output("paper-summary", "children"),
     Output("paper-positions", "children"),
     Output("paper-trades", "children"),
+    Output("candidate-cache", "data"),
     Input("refresh", "n_intervals"),
+    State("candidate-cache", "data"),
 )
-def update_dashboard(_: int):
+def update_dashboard(_: int, candidate_cache: Optional[List[Optional[Dict[str, Any]]]]):
     global_data = _safe_get(GLOBAL_URL)
     candidates_data = _safe_get(CANDIDATES_URL)
     promoted_data = _safe_get(PROMOTED_URL)
@@ -329,6 +481,7 @@ def update_dashboard(_: int):
             empty,
             empty,
             empty,
+            candidate_cache or [],
         )
 
     series = global_data.get("series", [])
@@ -339,7 +492,13 @@ def update_dashboard(_: int):
     fbar_fig = _line_figure("Aggregate Force (F̄)", fbar_series, "#ff6b6b")
 
     candidates = (candidates_data or {}).get("candidates", [])
-    candidate_table = _candidate_table(candidates[:20]) if candidates else html.Div("No candidates")
+    slots = _build_candidate_slots(candidate_cache, candidates)
+    candidate_rows = _candidate_rows(slots)
+    candidate_table = html.Table(
+        [html.Thead(candidate_rows[0]), html.Tbody(candidate_rows[1:])],
+        className="candidate-table",
+        style={"tableLayout": "fixed", "width": "100%"},
+    )
 
     promoted = (promoted_data or {}).get("promoted", [])
     cards = []
@@ -353,7 +512,7 @@ def update_dashboard(_: int):
     positions_view = _positions_table((paper_positions or {}).get("positions", []) if paper_positions else [])
     trades_view = _trades_table((paper_trades or {}).get("trades", []) if paper_trades else [])
 
-    return pbar_fig, fbar_fig, candidate_table, cards, paper_summary_view, positions_view, trades_view
+    return pbar_fig, fbar_fig, candidate_table, cards, paper_summary_view, positions_view, trades_view, slots
 
 
 if __name__ == "__main__":

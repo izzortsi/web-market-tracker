@@ -75,17 +75,7 @@ async def get_paper_positions(request: Request):
     processor = _get_processor(request)
     if processor is None or processor.paper is None:
         return JSONResponse({"message": "paper trading disabled"}, status_code=status.HTTP_404_NOT_FOUND)
-    positions = []
-    for pos in processor.paper.ledger.positions.values():
-        positions.append(
-            {
-                "symbol": pos.symbol,
-                "qty": pos.qty,
-                "avg_price": pos.avg_price,
-                "realized_pnl": pos.realized_pnl,
-            }
-        )
-    return {"positions": positions}
+    return {"positions": processor.paper.positions_view()}
 
 
 @router.get("/api/paper/trades")
@@ -93,17 +83,4 @@ async def get_paper_trades(request: Request):
     processor = _get_processor(request)
     if processor is None or processor.paper is None:
         return JSONResponse({"message": "paper trading disabled"}, status_code=status.HTTP_404_NOT_FOUND)
-    trades = []
-    for t in processor.paper.ledger.trades[-200:]:
-        trades.append(
-            {
-                "trade_id": t.trade_id,
-                "order_id": t.order_id,
-                "symbol": t.symbol,
-                "side": t.side,
-                "qty": t.qty,
-                "price": t.price,
-                "ts_ms": t.ts_ms,
-            }
-        )
-    return {"trades": trades}
+    return {"trades": processor.paper.trades_view()}
