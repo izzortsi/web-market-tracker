@@ -208,9 +208,12 @@ def _build_candidate_slots(
 
 def _candidate_rows(slots: List[Optional[Dict[str, Any]]]) -> List[html.Tr]:
     rows: List[html.Tr] = []
+    row_style = {"height": "28px"}
+    empty_cell = html.Td("\u00a0")
+
     for c in slots[:10]:
         if not c:
-            rows.append(html.Tr([html.Td("") for _ in range(8)]))
+            rows.append(html.Tr([empty_cell] * 8, style=row_style))
             continue
         last_price = c.get("last_price")
         price_change_pct = c.get("price_change_pct")
@@ -225,12 +228,13 @@ def _candidate_rows(slots: List[Optional[Dict[str, Any]]]) -> List[html.Tr]:
                     html.Td(f'{c.get("fee_threshold", 0):.6f}'),
                     html.Td(f'{last_price:.6f}' if last_price is not None else ""),
                     html.Td(f'{price_change_pct:.2f}%' if price_change_pct is not None else ""),
-                ]
+                ],
+                style=row_style,
             )
         )
 
     while len(rows) < 10:
-        rows.append(html.Tr([html.Td("") for _ in range(8)]))
+        rows.append(html.Tr([empty_cell] * 8, style=row_style))
 
     header = html.Tr(
         [
@@ -242,7 +246,8 @@ def _candidate_rows(slots: List[Optional[Dict[str, Any]]]) -> List[html.Tr]:
             html.Th("Fee Threshold"),
             html.Th("Last"),
             html.Th("24h %"),
-        ]
+        ],
+        style=row_style,
     )
     return [header, *rows]
 
