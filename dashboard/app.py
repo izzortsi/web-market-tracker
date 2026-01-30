@@ -1,4 +1,5 @@
 import os
+import math
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -34,12 +35,17 @@ def _empty_figure(title: str, color: str) -> go.Figure:
 
 def _line_figure(title: str, series: List[Dict[str, Any]], color: str) -> go.Figure:
     fig = go.Figure()
+    x_vals = [datetime.fromtimestamp(p["t"] / 1000) for p in series]
+    y_raw = [p["v"] for p in series]
+    y_plot = [math.copysign(math.log10(1 + abs(v)), v) for v in y_raw]
     fig.add_trace(
         go.Scatter(
-            x=[datetime.fromtimestamp(p["t"] / 1000) for p in series],
-            y=[p["v"] for p in series],
+            x=x_vals,
+            y=y_plot,
             mode="lines",
             line=dict(color=color),
+            customdata=y_raw,
+            hovertemplate="%{x}<br>raw=%{customdata:.4f}<extra></extra>",
         )
     )
     fig.update_layout(
@@ -49,6 +55,7 @@ def _line_figure(title: str, series: List[Dict[str, Any]], color: str) -> go.Fig
         paper_bgcolor="#111c2b",
         plot_bgcolor="#111c2b",
         font=dict(color="#e6edf3"),
+        yaxis=dict(title="symlog (log10(1+|v|))"),
     )
     return fig
 
@@ -427,7 +434,7 @@ app.layout = html.Div(
             className="section",
             children=[
                 html.H3("Candidates"),
-                html.Div(id="candidate-table", style={"minHeight": "320px"}),
+                html.Div(id="candidate-table", style={"height": "320px"}),
             ],
         ),
         html.Div(
@@ -478,15 +485,22 @@ def update_dashboard(_: int, candidate_cache: Optional[List[Optional[Dict[str, A
 
     if global_data is None:
         empty = html.Div("API unreachable", className="card")
+        slots = _build_candidate_slots(candidate_cache, [])
+        candidate_rows = _candidate_rows(slots)
+        candidate_table = html.Table(
+            [html.Thead(candidate_rows[0]), html.Tbody(candidate_rows[1:])],
+            className="candidate-table",
+            style={"tableLayout": "fixed", "width": "100%", "height": "100%"},
+        )
         return (
             _empty_figure("Aggregate Momentum (P̄)", "#00c896"),
             _empty_figure("Aggregate Force (F̄)", "#ff6b6b"),
-            empty,
+            candidate_table,
             [empty],
             empty,
             empty,
             empty,
-            candidate_cache or [],
+            slots,
         )
 
     series = global_data.get("series", [])
@@ -502,7 +516,7 @@ def update_dashboard(_: int, candidate_cache: Optional[List[Optional[Dict[str, A
     candidate_table = html.Table(
         [html.Thead(candidate_rows[0]), html.Tbody(candidate_rows[1:])],
         className="candidate-table",
-        style={"tableLayout": "fixed", "width": "100%"},
+        style={"tableLayout": "fixed", "width": "100%", "height": "100%"},
     )
 
     promoted = (promoted_data or {}).get("promoted", [])
